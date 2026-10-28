@@ -1,0 +1,142 @@
+rules_version = '2';
+
+// กฎความปลอดภัยของ Classroom Studio (Firestore)
+// ต้องแก้บรรทัด setupCode() ก่อนนำไปใช้ (ดูคู่มือ README-th.md)
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== แก้ข้อความนี้เป็นรหัสลับของคุณเอง ก่อน deploy =====
+    // ใช้ตอนสร้างบัญชีผู้ดูแลคนแรกเท่านั้น (กันคนแปลกหน้าสมัครเป็นผู้ดูแลก่อนคุณ)
+    function setupCode() { return '260626'; }
+
+    function signedIn() { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function me() { return get(userPath(request.auth.uid)).data; }
+
+    function isAdmin() { return hasProfile() && me().role == 'admin'; }
+    function isTeacher() { return hasProfile() && me().role == 'teacher'; }
+    function isStudent() { return hasProfile() && me().role == 'student'; }
+    function teachesRoom(roomId) { return isAdmin() || (isTeacher() && roomId in me().rooms); }
+
+    function roomDoc(roomId) { return get(/databases/$(database)/documents/rooms/$(roomId)).data; }
+    // นักเรียนทำสิ่งนี้ได้ไหม ตามที่ครูตั้งไว้ในห้อง (viewAssignments / submitWork / viewScores)
+    function studentCan(flag) { return isStudent() && roomDoc(me().roomId).studentAccess.get(flag, false) == true; }
+
+    function studentSubmitOk(subId) {
+      let d = request.resource.data;
+      let a = get(/databases/$(database)/documents/assignments/$(string(d.assignmentId))).data;
+      return isStudent()
+        && d.keys().hasOnly(['roomId', 'assignmentId', 'studentId', 'at', 'note', 'files'])
+        && d.roomId == me().roomId
+        && d.studentId == me().studentId
+        && subId == string(d.assignmentId) + '_' + string(d.studentId)
+        && studentCan('submitWork')
+        && a.roomId == me().roomId
+        && me().studentId in a.studentIds
+        && (!('dueAtMs' in a) || a.dueAtMs == null || request.time.toMillis() < a.dueAtMs)
+        && d.note.size() <= 2000
+        && d.files.size() <= 5;
+    }
+
+    match /config/{docId} {
+      allow get: if docId == 'setup' || signedIn();
+      allow create: if (docId == 'setup' && signedIn()
+                        && !exists(/databases/$(database)/documents/config/setup)
+                        && request.resource.data.code == setupCode())
+                    || (docId == 'school' && isAdmin());
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if (signedIn() && request.auth.uid == uid
+                        && request.resource.data.role == 'admin'
+                        && !exists(/databases/$(database)/documents/config/setup)
+                        && existsAfter(/databases/$(database)/documents/config/setup))
+                    || isAdmin()
+                    || (isTeacher() && request.resource.data.role == 'student'
+                        && request.resource.data.roomId in me().rooms);
+      allow update: if isAdmin()
+                    || (isTeacher() && resource.data.role == 'student'
+                        && resource.data.roomId in me().rooms
+                        && request.resource.data.role == 'student'
+                        && request.resource.data.roomId == resource.data.roomId);
+      allow delete: if isAdmin()
+                    || (isTeacher() && resource.data.role == 'student'
+                        && resource.data.roomId in me().rooms);
+    }
+
+    match /rooms/{roomId} {
+      allow get: if teachesRoom(roomId) || (isStudent() && me().roomId == roomId);
+      allow list: if isAdmin();
+      allow create, delete: if isAdmin();
+      allow update: if teachesRoom(roomId);
+    }
+
+    match /students/{sid} {
+      allow get: if teachesRoom(resource.data.roomId)
+                 || (isStudent() && resource.data.authUid == request.auth.uid && studentCan('viewScores'));
+      allow list: if teachesRoom(resource.data.roomId);
+      allow create: if teachesRoom(request.resource.data.roomId);
+      allow update: if teachesRoom(resource.data.roomId)
+                    && request.resource.data.roomId == resource.data.roomId;
+      allow delete: if teachesRoom(resource.data.roomId);
+    }
+
+    // PIN ของนักเรียน: ครูของห้องเท่านั้นที่อ่านได้
+    match /studentSecrets/{sid} {
+      allow read: if teachesRoom(resource.data.roomId);
+      allow create: if teachesRoom(request.resource.data.roomId);
+      allow update: if teachesRoom(resource.data.roomId)
+                    && request.resource.data.roomId == resource.data.roomId;
+      allow delete: if teachesRoom(resource.data.roomId);
+    }
+
+    // รหัสนักเรียน (จาก QR) -> อีเมลภายในระบบ ใช้ตอนนักเรียนล็อกอิน
+    match /studentLookup/{loginId} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if isAdmin() || isTeacher();
+    }
+
+    match /assignments/{aid} {
+      allow read: if teachesRoom(resource.data.roomId)
+                  || (isStudent()
+                      && resource.data.roomId == me().roomId
+                      && me().studentId in resource.data.studentIds
+                      && (studentCan('viewAssignments') || studentCan('submitWork')));
+      allow create: if teachesRoom(request.resource.data.roomId);
+      allow update: if teachesRoom(resource.data.roomId)
+                    && request.resource.data.roomId == resource.data.roomId;
+      allow delete: if teachesRoom(resource.data.roomId);
+    }
+
+    // คะแนนและสถานะที่ครูตรวจ: นักเรียนอ่านได้เฉพาะของตัวเอง และเมื่อครูเปิดสิทธิ์ดูคะแนน
+    match /results/{rid} {
+      allow read: if teachesRoom(resource.data.roomId)
+                  || (isStudent()
+                      && resource.data.roomId == me().roomId
+                      && resource.data.studentId == me().studentId
+                      && studentCan('viewScores'));
+      allow create: if teachesRoom(request.resource.data.roomId);
+      allow update: if teachesRoom(resource.data.roomId)
+                    && request.resource.data.roomId == resource.data.roomId;
+      allow delete: if teachesRoom(resource.data.roomId);
+    }
+
+    match /submissions/{subId} {
+      allow read: if teachesRoom(resource.data.roomId)
+                  || (isStudent()
+                      && resource.data.roomId == me().roomId
+                      && resource.data.studentId == me().studentId);
+      allow create: if teachesRoom(request.resource.data.roomId) || studentSubmitOk(subId);
+      allow update: if (teachesRoom(resource.data.roomId) && request.resource.data.roomId == resource.data.roomId)
+                    || studentSubmitOk(subId);
+      allow delete: if teachesRoom(resource.data.roomId)
+                    || (isStudent() && resource.data.studentId == me().studentId && studentCan('submitWork'));
+    }
+  }
+}

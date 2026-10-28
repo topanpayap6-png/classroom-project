@@ -1,0 +1,36 @@
+rules_version = '2';
+
+// กฎความปลอดภัยของไฟล์ (Firebase Storage)
+// ต้องให้สิทธิ์อ่าน Firestore ข้ามบริการ: ทำตามคู่มือ README-th.md ข้อ "เปิดสิทธิ์ให้ Storage อ่าน Firestore"
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data; }
+    function roomDoc(roomId) { return firestore.get(/databases/(default)/documents/rooms/$(roomId)).data; }
+    function teachesRoom(roomId) {
+      return signedIn() && (userDoc().role == 'admin' || (userDoc().role == 'teacher' && roomId in userDoc().rooms));
+    }
+    function studentOf(roomId) { return signedIn() && userDoc().role == 'student' && userDoc().roomId == roomId; }
+    function can(roomId, flag) { return roomDoc(roomId).studentAccess.get(flag, false) == true; }
+
+    // ไฟล์แนบที่ครูใส่ในงาน
+    match /assignmentFiles/{roomId}/{assignmentId}/{fileId} {
+      allow read: if teachesRoom(roomId)
+                  || (studentOf(roomId) && (can(roomId, 'viewAssignments') || can(roomId, 'submitWork')));
+      allow create, update: if teachesRoom(roomId) && request.resource.size < 15 * 1024 * 1024;
+      allow delete: if teachesRoom(roomId);
+    }
+
+    // ไฟล์งานที่นักเรียนส่ง
+    match /submissionFiles/{roomId}/{assignmentId}/{studentId}/{fileId} {
+      allow read: if teachesRoom(roomId)
+                  || (studentOf(roomId) && string(userDoc().studentId) == studentId);
+      allow create, update: if (teachesRoom(roomId)
+                                || (studentOf(roomId) && string(userDoc().studentId) == studentId && can(roomId, 'submitWork')))
+                            && request.resource.size < 15 * 1024 * 1024;
+      allow delete: if teachesRoom(roomId)
+                    || (studentOf(roomId) && string(userDoc().studentId) == studentId && can(roomId, 'submitWork'));
+    }
+  }
+}
